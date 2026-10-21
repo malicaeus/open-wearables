@@ -4,6 +4,7 @@ from decimal import Decimal
 from typing import Any, TypeVar
 from uuid import UUID, uuid4
 
+import httpx
 from fastapi import HTTPException, status
 from pydantic import BaseModel, ValidationError
 
@@ -21,7 +22,7 @@ from app.constants.series_types.polar import (
 from app.database import DbSession
 from app.repositories.data_point_series_repository import WriteCounts
 from app.repositories.user_connection_repository import UserConnectionRepository
-from app.schemas.enums import EventCategory, HealthScoreCategory, ProviderName, SeriesType, daily_total_flag
+from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, daily_total_flag
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -56,6 +57,7 @@ from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
 from app.services.providers.api_client import make_authenticated_request
 from app.services.providers.polar.coverage import ACTIVITY_SERIES
+from app.services.providers.polar.oauth import PolarSleepV4OAuth
 from app.services.providers.sync_247_result import Sync247Result
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
@@ -87,6 +89,12 @@ class Polar247Data(Base247DataTemplate):
     ):
         super().__init__(provider_name, api_base_url, oauth)
         self.connection_repo = UserConnectionRepository()
+        self.sleep_v4_oauth = PolarSleepV4OAuth(
+            user_repo=oauth.user_repo,
+            connection_repo=self.connection_repo,
+            provider_name="polar_sleep_v4",
+            api_base_url=api_base_url,
+        )
 
     def _make_api_request(
         self,
@@ -183,7 +191,71 @@ class Polar247Data(Base247DataTemplate):
             response = self._make_api_request(db, user_id, f"/v3/users/sleep/{d.isoformat()}")
             if response:
                 sleep_data.append(response)
+        efficiencies = self._get_v4_sleep_efficiencies(
+            db, user_id, {item["date"] for item in sleep_data if item.get("date")}
+        )
+        for item in sleep_data:
+            sleep_date = item.get("date")
+            if sleep_date in efficiencies:
+                item["sleep_efficiency_percent"] = efficiencies[sleep_date]
         return sleep_data
+
+    def _get_v4_sleep_efficiencies(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        sleep_dates: set[str],
+    ) -> dict[str, float]:
+        """Read one v4 sleep evaluation per day using the separate sleep:read grant."""
+        access_token = self.sleep_v4_oauth.get_sleep_access_token(db, user_id)
+        if not access_token:
+            return {}
+        efficiencies: dict[str, float] = {}
+        for sleep_date in sorted(sleep_dates):
+            try:
+                response = httpx.get(
+                    f"{self.api_base_url}/v4/data/sleeps",
+                    params={
+                        "from": sleep_date,
+                        "to": (date.fromisoformat(sleep_date) + timedelta(days=1)).isoformat(),
+                        "features": "sleep-evaluation",
+                    },
+                    headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+                    timeout=30.0,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                store_raw_payload(
+                    source="api_response",
+                    provider="polar",
+                    payload=payload,
+                    user_id=str(user_id),
+                    trace_id="/v4/data/sleeps",
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in {401, 403, 404}:
+                    log_structured(
+                        self.logger,
+                        "info",
+                        "Polar v4 sleep evaluation is unavailable for this authorization or date",
+                        provider="polar",
+                        action="v4_sleep_efficiency_unavailable",
+                        user_id=str(user_id),
+                        status_code=exc.response.status_code,
+                    )
+                    continue
+                raise
+
+            for night in (payload or {}).get("nightSleeps", []):
+                response_date = night.get("sleepDate")
+                efficiency = ((night.get("sleepEvaluation") or {}).get("analysis") or {}).get("efficiencyPercent")
+                if (
+                    response_date == sleep_date
+                    and isinstance(efficiency, (int, float))
+                    and 0 <= efficiency <= 100
+                ):
+                    efficiencies[sleep_date] = float(efficiency)
+        return efficiencies
 
     def _parse_hypnogram(
         self,
@@ -266,7 +338,8 @@ class Polar247Data(Base247DataTemplate):
 
             record = EventRecordCreate(
                 id=sleep_id,
-                category=EventCategory.SLEEP,
+                external_id=parsed.date,
+                category="sleep",
                 type="sleep_session",
                 source_name="Polar",
                 source=ProviderName.POLAR,
@@ -281,6 +354,11 @@ class Polar247Data(Base247DataTemplate):
                 record_id=sleep_id,
                 sleep_total_duration_minutes=(light_s + deep_s + rem_s) // 60,
                 sleep_time_in_bed_minutes=duration_seconds // 60 if duration_seconds else None,
+                sleep_efficiency_score=(
+                    Decimal(str(parsed.sleep_efficiency_percent))
+                    if parsed.sleep_efficiency_percent is not None
+                    else None
+                ),
                 sleep_deep_minutes=deep_s // 60,
                 sleep_light_minutes=light_s // 60,
                 sleep_rem_minutes=rem_s // 60,
@@ -320,6 +398,18 @@ class Polar247Data(Base247DataTemplate):
             hr_samples = [s.model_copy(update={"device_id": parsed.device_id}) for s in hr_samples]
             results.append((record, detail, score, hr_samples))
         return results
+
+    def _sleep_windows(self, raw_items: list[dict[str, Any]], user_id: UUID) -> dict[date, tuple[datetime, datetime]]:
+        windows: dict[date, tuple[datetime, datetime]] = {}
+        for raw in raw_items:
+            parsed = self._parse(raw, SleepJSON, user_id, "sleep")
+            if not parsed or not parsed.date or not parsed.sleep_start_time or not parsed.sleep_end_time:
+                continue
+            windows[date.fromisoformat(parsed.date)] = (
+                datetime.fromisoformat(parsed.sleep_start_time),
+                datetime.fromisoformat(parsed.sleep_end_time),
+            )
+        return windows
 
     # -------------------------------------------------------------------------
     # Daily Activity - GET /v3/users/activities
@@ -549,12 +639,12 @@ class Polar247Data(Base247DataTemplate):
         self,
         raw_items: list[dict[str, Any]],
         user_id: UUID,
+        sleep_windows: dict[date, tuple[datetime, datetime]] | None = None,
     ) -> NightlyRechargeNormalized:
-        """HRV and breathing rate are four-hour averages from early sleep, so one sample per night.
+        """Normalize nightly averages and individual five-minute HRV and breathing samples.
 
-        Samples are emitted only for records processed by future syncs; existing database rows
-        are not updated. Historical records not processed again by a sync require a separate
-        backfill or replay to populate their time-series samples.
+        Individual sample times are resolved against the matching sleep window when available.
+        Existing database rows are refreshed by the time-series upsert path.
         """
         scores: list[HealthScoreCreate] = []
         samples: list[TimeSeriesSampleCreate] = []
@@ -577,6 +667,31 @@ class Polar247Data(Base247DataTemplate):
                             provider=ProviderName.POLAR,
                             source=ProviderName.POLAR,
                             recorded_at=recorded_at,
+                            value=value,
+                            series_type=series_type,
+                        )
+                    )
+            sleep_window = (sleep_windows or {}).get(date.fromisoformat(parsed.date))
+            for values, series_type in (
+                (parsed.hrv_samples, SeriesType.heart_rate_variability_rmssd),
+                (parsed.breathing_samples, SeriesType.respiratory_rate),
+            ):
+                if not values:
+                    continue
+                if sleep_window:
+                    sample_datetimes = self._hhmm_datetimes_in_window(values, *sleep_window)
+                else:
+                    sample_datetimes = self._hhmm_to_datetimes(values, recorded_at)
+                for sample_at, value in sample_datetimes:
+                    if sample_at == recorded_at:
+                        continue
+                    samples.append(
+                        TimeSeriesSampleCreate(
+                            id=uuid4(),
+                            user_id=user_id,
+                            provider=ProviderName.POLAR,
+                            source=ProviderName.POLAR,
+                            recorded_at=sample_at,
                             value=value,
                             series_type=series_type,
                         )
@@ -612,6 +727,24 @@ class Polar247Data(Base247DataTemplate):
                 )
             )
         return scores, samples
+
+    def _hhmm_datetimes_in_window(
+        self,
+        items: dict[str, Any],
+        sleep_start: datetime,
+        sleep_end: datetime,
+    ) -> list[tuple[datetime, Any]]:
+        """Resolve Polar's date-less device times to the matching instant in a sleep window."""
+        result: list[tuple[datetime, Any]] = []
+        day = sleep_start.date() - timedelta(days=1)
+        last_day = sleep_end.date() + timedelta(days=1)
+        while day <= last_day:
+            for key, value in items.items():
+                at = datetime.combine(day, self._parse_time_key(key), tzinfo=sleep_start.tzinfo)
+                if sleep_start <= at <= sleep_end:
+                    result.append((at, value))
+            day += timedelta(days=1)
+        return sorted(result, key=lambda sample: sample[0])
 
     # -------------------------------------------------------------------------
     # SleepWise — Alertness: GET /v3/users/sleepwise/alertness
@@ -995,6 +1128,7 @@ class Polar247Data(Base247DataTemplate):
         user_id: UUID,
         start_time: datetime,
         end_time: datetime,
+        sleep_data: list[dict[str, Any]] | None = None,
     ) -> int:
         """Save the night's score and samples, reporting the series writes.
 
@@ -1002,7 +1136,9 @@ class Polar247Data(Base247DataTemplate):
         health scores are inserted with on_conflict_do_nothing and report nothing back.
         """
         scores, samples = self.normalize_nightly_recharge(
-            self.get_nightly_recharge_data(db, user_id, start_time, end_time), user_id
+            self.get_nightly_recharge_data(db, user_id, start_time, end_time),
+            user_id,
+            sleep_windows=self._sleep_windows(sleep_data or [], user_id),
         )
         self._save_scores(db, scores)
         return self._save_timeseries(db, samples)
@@ -1013,9 +1149,10 @@ class Polar247Data(Base247DataTemplate):
         user_id: UUID,
         start_time: datetime,
         end_time: datetime,
+        raw_items: list[dict[str, Any]] | None = None,
     ) -> int:
         """Returns the number of sleep sessions saved (score and HR rows ride along)."""
-        raw_items = self.get_sleep_data(db, user_id, start_time, end_time)
+        raw_items = raw_items if raw_items is not None else self.get_sleep_data(db, user_id, start_time, end_time)
         normalized = self.normalize_sleep(raw_items, user_id)
         count = 0
         scores: list[HealthScoreCreate] = []
@@ -1054,8 +1191,16 @@ class Polar247Data(Base247DataTemplate):
     ) -> Sync247Result:
         start_time, end_time = self.resolve_window(start_time, end_time)
 
+        raw_sleep_data: list[dict[str, Any]] | None = None
+
+        def get_raw_sleep_data() -> list[dict[str, Any]]:
+            nonlocal raw_sleep_data
+            if raw_sleep_data is None:
+                raw_sleep_data = self.get_sleep_data(db, user_id, start_time, end_time)
+            return raw_sleep_data
+
         tasks: dict[str, Callable[[], WriteCounts | int]] = {
-            "sleep": lambda: self._save_sleep(db, user_id, start_time, end_time),
+            "sleep": lambda: self._save_sleep(db, user_id, start_time, end_time, get_raw_sleep_data()),
             "daily_activity": lambda: self._save_timeseries(
                 db,
                 self.normalize_daily_activity(
@@ -1069,7 +1214,9 @@ class Polar247Data(Base247DataTemplate):
             "cardio_load": lambda: self._save_scores(
                 db, self.normalize_cardio_load(self.get_cardio_load_data(db, user_id, start_time, end_time), user_id)
             ),
-            "nightly_recharge": lambda: self._save_nightly_recharge(db, user_id, start_time, end_time),
+            "nightly_recharge": lambda: self._save_nightly_recharge(
+                db, user_id, start_time, end_time, get_raw_sleep_data()
+            ),
             "alertness": lambda: self._save_scores(
                 db, self.normalize_alertness(self.get_alertness_data(db, user_id, start_time, end_time), user_id)
             ),
