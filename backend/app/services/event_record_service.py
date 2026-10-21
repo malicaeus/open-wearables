@@ -763,10 +763,10 @@ class EventRecordService(
         self,
         db_session: DbSession,
         details: list[EventRecordDetailCreate],
-        detail_type: str = "workout",
+        detail_type: DetailType = "workout",
     ) -> None:
         """Bulk create event record details and fire one webhook per detail on commit."""
-        self.event_record_detail_repo.bulk_create(db_session, details, detail_type=detail_type)  # ty:ignore[invalid-argument-type]
+        self.event_record_detail_repo.bulk_create(db_session, details, detail_type=detail_type)
 
         if not details or not svix_service.is_enabled():
             return

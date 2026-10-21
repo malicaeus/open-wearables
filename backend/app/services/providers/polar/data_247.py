@@ -207,7 +207,19 @@ class Polar247Data(Base247DataTemplate):
         sleep_dates: set[str],
     ) -> dict[str, float]:
         """Read one v4 sleep evaluation per day using the separate sleep:read grant."""
-        access_token = self.sleep_v4_oauth.get_sleep_access_token(db, user_id)
+        try:
+            access_token = self.sleep_v4_oauth.get_sleep_access_token(db, user_id)
+        except HTTPException as exc:
+            log_structured(
+                self.logger,
+                "warning",
+                "Polar v4 sleep authorization could not be refreshed; continuing with v3 sleep data",
+                provider="polar",
+                action="v4_sleep_token_refresh_failed",
+                user_id=str(user_id),
+                status_code=exc.status_code,
+            )
+            return {}
         if not access_token:
             return {}
         efficiencies: dict[str, float] = {}
@@ -233,18 +245,27 @@ class Polar247Data(Base247DataTemplate):
                     trace_id="/v4/data/sleeps",
                 )
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code in {401, 403, 404}:
-                    log_structured(
-                        self.logger,
-                        "info",
-                        "Polar v4 sleep evaluation is unavailable for this authorization or date",
-                        provider="polar",
-                        action="v4_sleep_efficiency_unavailable",
-                        user_id=str(user_id),
-                        status_code=exc.response.status_code,
-                    )
-                    continue
-                raise
+                log_structured(
+                    self.logger,
+                    "info" if exc.response.status_code in {401, 403, 404} else "warning",
+                    "Polar v4 sleep evaluation is unavailable; continuing with v3 sleep data",
+                    provider="polar",
+                    action="v4_sleep_efficiency_unavailable",
+                    user_id=str(user_id),
+                    status_code=exc.response.status_code,
+                )
+                continue
+            except httpx.HTTPError as exc:
+                log_structured(
+                    self.logger,
+                    "warning",
+                    "Polar v4 sleep evaluation request failed; continuing with v3 sleep data",
+                    provider="polar",
+                    action="v4_sleep_efficiency_request_failed",
+                    user_id=str(user_id),
+                    error_type=type(exc).__name__,
+                )
+                continue
 
             for night in (payload or {}).get("nightSleeps", []):
                 response_date = night.get("sleepDate")
@@ -655,47 +676,54 @@ class Polar247Data(Base247DataTemplate):
                 continue
             # Polar sends a bare date, so anchor the night to UTC midnight instead of leaving it naive.
             recorded_at = datetime.fromisoformat(parsed.date).replace(tzinfo=timezone.utc)
-            for value, series_type in (
+            aggregate_rows = (
                 (parsed.heart_rate_variability_avg, SeriesType.heart_rate_variability_rmssd),
                 (parsed.breathing_rate_avg, SeriesType.respiratory_rate),
-            ):
-                if value is not None:
-                    samples.append(
-                        TimeSeriesSampleCreate(
-                            id=uuid4(),
-                            user_id=user_id,
-                            provider=ProviderName.POLAR,
-                            source=ProviderName.POLAR,
-                            recorded_at=recorded_at,
-                            value=value,
-                            series_type=series_type,
-                        )
-                    )
+            )
             sleep_window = (sleep_windows or {}).get(date.fromisoformat(parsed.date))
+            resolved_samples: list[tuple[datetime, int | float, SeriesType]] = []
             for values, series_type in (
                 (parsed.hrv_samples, SeriesType.heart_rate_variability_rmssd),
                 (parsed.breathing_samples, SeriesType.respiratory_rate),
             ):
-                if not values:
-                    continue
-                if sleep_window:
-                    sample_datetimes = self._hhmm_datetimes_in_window(values, *sleep_window)
-                else:
-                    sample_datetimes = self._hhmm_to_datetimes(values, recorded_at)
-                for sample_at, value in sample_datetimes:
-                    if sample_at == recorded_at:
-                        continue
+                if values:
+                    sample_datetimes = (
+                        self._hhmm_datetimes_in_window(values, *sleep_window)
+                        if sleep_window
+                        else self._hhmm_to_datetimes(values, recorded_at)
+                    )
+                    resolved_samples.extend((sample_at, value, series_type) for sample_at, value in sample_datetimes)
+            for value, series_type in aggregate_rows:
+                if value is not None:
+                    aggregate_at = recorded_at
+                    if any(
+                        sample_at == recorded_at and sample_series == series_type
+                        for sample_at, _, sample_series in resolved_samples
+                    ):
+                        aggregate_at += timedelta(microseconds=1)
                     samples.append(
                         TimeSeriesSampleCreate(
                             id=uuid4(),
                             user_id=user_id,
                             provider=ProviderName.POLAR,
                             source=ProviderName.POLAR,
-                            recorded_at=sample_at,
+                            recorded_at=aggregate_at,
                             value=value,
                             series_type=series_type,
                         )
                     )
+            samples.extend(
+                TimeSeriesSampleCreate(
+                    id=uuid4(),
+                    user_id=user_id,
+                    provider=ProviderName.POLAR,
+                    source=ProviderName.POLAR,
+                    recorded_at=sample_at,
+                    value=value,
+                    series_type=series_type,
+                )
+                for sample_at, value, series_type in resolved_samples
+            )
             # Polar withholds the status until it has three nights to compare against.
             if parsed.nightly_recharge_status is None:
                 continue

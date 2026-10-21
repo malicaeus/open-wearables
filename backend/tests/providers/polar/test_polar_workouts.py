@@ -573,6 +573,8 @@ class TestGetUnifiedWorkoutType:
             ("OTHER", "KICKBOXING_MARTIAL_ARTS", WorkoutType.BOXING),
             ("OTHER", "TENNIS", WorkoutType.TENNIS),
             ("OTHER", "BADMINTON", WorkoutType.BADMINTON),
+            ("OTHER", "PICKLEBALL", WorkoutType.PICKLEBALL),
+            ("OTHER", "RACKET_SPORTS_PICKLEBALL", WorkoutType.PICKLEBALL),
             ("OTHER", "VERTICALSPORTS_WALLCLIMBING", WorkoutType.INDOOR_CLIMBING),
             ("OTHER", "STRENGTH_TRAINING", WorkoutType.STRENGTH_TRAINING),
         ],

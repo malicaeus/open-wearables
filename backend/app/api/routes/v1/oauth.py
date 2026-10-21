@@ -59,11 +59,24 @@ def get_polar_sleep_v4_oauth() -> PolarSleepV4OAuth:
 
 @router.get("/polar-sleep/authorize", response_model=AuthorizationURLResponse, tags=["External: Providers"])
 def authorize_polar_sleep_v4(
+    db: DbSession,
     user_id: Annotated[UUID, Query(description="User ID with an existing Polar v3 connection")],
     redirect_uri: Annotated[str | None, Query(description="Optional URL to return after both Polar grants")] = None,
 ):
     """Start the separate Polar v4 sleep authorization flow."""
+    strategy = factory.get_provider(ProviderName.POLAR.value)
+    assert strategy.oauth
+    if not strategy.oauth.connection_repo.get_by_user_and_provider(db, user_id, ProviderName.POLAR.value):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Connect the legacy Polar integration before authorizing Polar sleep v4.",
+        )
     oauth = get_polar_sleep_v4_oauth()
+    if not oauth.credentials.client_id or not oauth.credentials.client_secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Polar v4 OAuth credentials are not configured.",
+        )
     auth_url, state = oauth.get_authorization_url(user_id, redirect_uri)
     return AuthorizationURLResponse(authorization_url=auth_url, state=state)
 
@@ -78,6 +91,15 @@ def polar_sleep_v4_callback(
 ):
     """Save the v4 sleep grant without replacing the legacy Polar v3 token."""
     if error:
+        oauth = get_polar_sleep_v4_oauth()
+        if state:
+            try:
+                oauth_state, _ = oauth._validate_state(state)
+                if oauth_state.provider == "polar_sleep_v4":
+                    user_connection_service.stamp_last_synced_at(db, oauth_state.user_id, ProviderName.POLAR.value)
+                    _schedule_historical_sync(oauth_state.user_id, ProviderName.POLAR)
+            except HTTPException:
+                pass
         return RedirectResponse(
             url=f"/api/v1/oauth/error?message={error}:+{error_description or 'Unknown+error'}",
             status_code=303,
@@ -181,6 +203,15 @@ def oauth_callback(
     # consent step, then start the initial sync only after both tokens are saved.
     if provider_name == ProviderName.POLAR:
         polar_v4_oauth = get_polar_sleep_v4_oauth()
+        if not polar_v4_oauth.credentials.client_id or not polar_v4_oauth.credentials.client_secret:
+            user_connection_service.stamp_last_synced_at(db, oauth_state.user_id, provider_name.value)
+            _schedule_historical_sync(oauth_state.user_id, provider_name)
+            if oauth_state.redirect_uri:
+                return RedirectResponse(url=oauth_state.redirect_uri, status_code=303)
+            return RedirectResponse(
+                url=f"/api/v1/oauth/success?provider={provider_name.value}&user_id={oauth_state.user_id}",
+                status_code=303,
+            )
         authorization_url, _ = polar_v4_oauth.get_authorization_url(
             oauth_state.user_id, redirect_uri=oauth_state.redirect_uri
         )

@@ -36,6 +36,18 @@ Polar provides access to exercise, daily activity, sleep, and heart rate data fr
 | SpO2 | Yes (requires Polar Elixir device) |
 | Wrist ECG | Yes (requires Polar Elixir device) |
 
+### Polar workout type mappings
+
+Polar's `sport` and `detailed_sport_info` values are normalized to Open Wearables workout types as follows:
+
+| Polar sport | `detailed_sport_info` | Unified workout type |
+|---|---|---|
+| `TENNIS` | — | `TENNIS` |
+| `OTHER` | `BADMINTON` / `RACKET_SPORTS_BADMINTON` | `BADMINTON` |
+| `OTHER` | `PICKLEBALL` / `RACKET_SPORTS_PICKLEBALL` | `PICKLEBALL` |
+| `OTHER` | `VERTICALSPORTS_WALLCLIMBING` | `INDOOR_CLIMBING` |
+| `STRENGTH_TRAINING` or `OTHER` | `STRENGTH_TRAINING` | `STRENGTH_TRAINING` |
+
 ### Data delivery
 
 | Method | Description |
@@ -103,13 +115,15 @@ Webhook delivery requires a registered webhook subscription and `POLAR_WEBHOOK_S
     Add the following to your `.env` file:
 
 ```bash
-# Public base URL of your API. The OAuth redirect URI is derived from this as
-# {API_BASE_URL}/api/v1/oauth/polar/callback.
+# Public base URL of your API. Both v3 and v4 OAuth callback URLs are derived from it.
 API_BASE_URL=http://localhost:8000
 
 #--- Polar ---#
 POLAR_CLIENT_ID=your-polar-client-id
 POLAR_CLIENT_SECRET=your-polar-client-secret
+# Optional separate AccessLink v4 credentials (default to the v3 credentials)
+# POLAR_V4_CLIENT_ID=your-polar-v4-client-id
+# POLAR_V4_CLIENT_SECRET=your-polar-v4-client-secret
 # Optional — required only if using webhooks (set automatically on first registration)
 POLAR_WEBHOOK_SIGNATURE_SECRET=
 ```

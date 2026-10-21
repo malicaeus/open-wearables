@@ -182,10 +182,15 @@ class SummariesService:
 
             entries_sorted = sorted(entries, key=sort_key)
             selected = dict(entries_sorted[0])
+            matching_source_entries = [
+                entry
+                for entry in entries_sorted[1:]
+                if entry.get("provider") == selected.get("provider") and entry.get("source") == selected.get("source")
+            ]
             for field in merge_fields:
                 if selected.get(field) is None:
                     selected[field] = next(
-                        (entry.get(field) for entry in entries_sorted[1:] if entry.get(field) is not None), None
+                        (entry.get(field) for entry in matching_source_entries if entry.get(field) is not None), None
                     )
             filtered.append(selected)
 
@@ -625,7 +630,7 @@ class SummariesService:
             active_cal = result.get("active_energy_sum")
             basal_cal = result.get("basal_energy_sum")
             total_cal = result.get("total_energy_sum")
-            if total_cal is None and active_cal is not None and basal_cal is not None:
+            if active_cal is not None and basal_cal is not None:
                 total_cal = active_cal + basal_cal
 
             # Active minutes: prefer the provider-reported daily active time (Garmin
