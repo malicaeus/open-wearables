@@ -15,7 +15,7 @@ from app.database import DbSession
 from app.models import EventRecord
 from app.repositories import EventRecordRepository, UserConnectionRepository
 from app.repositories.data_point_series_repository import WriteCounts
-from app.schemas.enums import EventCategory, HealthScoreCategory, ProviderName, SeriesType, daily_total_flag
+from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, TimeSeriesRole, daily_total_flag
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -743,7 +743,7 @@ class Oura247Data(Base247DataTemplate):
 
             record = EventRecordCreate(
                 id=sleep_id,
-                category=EventCategory.SLEEP,
+                category="sleep",
                 type="sleep_session",
                 source_name="Oura",
                 device_model=None,
@@ -800,9 +800,9 @@ class Oura247Data(Base247DataTemplate):
             hr: OuraIntervalData | None = normalized_sleep.get("heart_rate")
             hrv: OuraIntervalData | None = normalized_sleep.get("hrv")
 
-            for interval_data, series_type, action in (
-                (hr, SLEEP_INTERVAL_SERIES["heart_rate"], "oura_sleep_hr_save_error"),
-                (hrv, SLEEP_INTERVAL_SERIES["hrv"], "oura_hrv_save_error"),
+            for interval_data, series_type, action, sample_role in (
+                (hr, SLEEP_INTERVAL_SERIES["heart_rate"], "oura_sleep_hr_save_error", TimeSeriesRole.MEASUREMENT),
+                (hrv, SLEEP_INTERVAL_SERIES["hrv"], "oura_hrv_save_error", TimeSeriesRole.NIGHTLY_SAMPLE),
             ):
                 if not (interval_data and interval_data.timestamp and interval_data.interval and interval_data.items):
                     continue
@@ -821,6 +821,7 @@ class Oura247Data(Base247DataTemplate):
                             zone_offset=interval_zone_offset,
                             value=Decimal(str(value)),
                             series_type=series_type,
+                            sample_role=sample_role,
                         )
                         for i, value in enumerate(interval_data.items)
                         if value is not None

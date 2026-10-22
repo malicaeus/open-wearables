@@ -30,6 +30,18 @@
 	);
 
 	const rows = $derived(stageRows(session));
+	const hasOvernightSamples = $derived(['oura', 'polar'].includes(session.source.provider));
+	const sampleOrder = $derived(
+		session.source.provider === 'oura' ? ['heart_rate_variability_rmssd'] : HEART_AND_BREATH_TYPES
+	);
+	const sampleTitle = $derived(
+		session.source.provider === 'oura' ? 'Nightly HRV samples' : 'Nightly HRV and breathing samples'
+	);
+	const emptySamples = $derived(
+		session.source.provider === 'oura'
+			? 'No individual HRV samples were stored for this night.'
+			: 'No individual HRV or breathing samples were stored for this night.'
+	);
 	const sampleParams = $derived(
 		new URLSearchParams({
 			from: session.start_time,
@@ -67,18 +79,18 @@
 
 	<DistributionBar title="Time in each stage" icon={Layers} {rows} />
 
-	{#if session.source.provider === 'polar'}
+	{#if hasOvernightSamples}
 		<div class="flex flex-col gap-1.5">
-			<Caption>Nightly HRV and breathing samples</Caption>
+			<Caption>{sampleTitle}</Caption>
 			<SamplesChart
 				url={() => `/users/${userId}/sleep/samples?${sampleParams}`}
-				order={HEART_AND_BREATH_TYPES}
+				order={sampleOrder}
 				sampleRole="nightly_sample"
 				from={new Date(session.start_time).getTime()}
 				to={new Date(session.end_time).getTime()}
 				formatTime={(at) => clock(new Date(at).toISOString())}
-				label="Nightly HRV and breathing samples"
-				empty="No individual HRV or breathing samples were stored for this night."
+				label={sampleTitle}
+				empty={emptySamples}
 			/>
 		</div>
 	{/if}

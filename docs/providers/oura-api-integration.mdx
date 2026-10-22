@@ -23,7 +23,7 @@ Oura provides access to sleep, readiness, activity, heart rate, and workout data
 
 | Data Type | Support |
 |-----------|---------|
-| Sleep (with stages) | Yes |
+| Sleep (with stages and individual overnight HRV samples) | Yes |
 | Readiness (recovery score) | Yes |
 | Activity (daily activity score) | Yes |
 | Heart rate (24/7) | Yes |
@@ -209,7 +209,7 @@ OURA_WEBHOOK_VERIFICATION_TOKEN=your-oura-webhook-verification-token
     curl -X GET "http://localhost:8000/api/v1/users/{user_id}/events/sleep?start_date=2026-01-01T00:00:00Z&end_date=2026-02-01T00:00:00Z" \
       -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
 
-    # Fetch timeseries data (heart rate, SpO2, activity, VO2 max, cardiovascular age)
+    # Fetch timeseries data (heart rate, SpO2, activity, VO2 max, cardiovascular age, overnight HRV samples)
     curl -X GET "http://localhost:8000/api/v1/users/{user_id}/timeseries?start_time=2026-01-01T00:00:00Z&end_time=2026-02-01T00:00:00Z" \
       -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
     ```
@@ -217,6 +217,12 @@ OURA_WEBHOOK_VERIFICATION_TOKEN=your-oura-webhook-verification-token
     If data is returned, your Oura integration is working end-to-end.
   </Step>
 </Steps>
+
+## Overnight HRV samples
+
+Oura sleep records include an `hrv` interval object with a starting `timestamp`, an `interval` in seconds, and an `items` array. Open Wearables stores each non-null item as a `heart_rate_variability_rmssd` time-series observation at `timestamp + interval × item index`, tagged with `sample_role: nightly_sample`. This preserves Oura's reported values and timing; no nightly values are calculated or interpolated.
+
+When a sleep session is expanded in the dashboard, its details show the nightly HRV chart when samples are available. Existing nightly HRV summaries remain part of the sleep record. API consumers can retrieve the samples and their timestamps and `sample_role` from `GET /api/v1/users/{user_id}/timeseries`.
 
 ## API Details
 
